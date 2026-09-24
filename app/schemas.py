@@ -118,3 +118,41 @@ class ProductionLimitOut(BaseModel):
     delayed_item_ids: list[str] = Field(..., description="延期器物编号，按编号升序")
     kiln_count: int = Field(..., description="保留器物的实际窑次（最少窑次）")
     kilns: list[KilnOut] = Field(..., description="保留器物的实际装窑明细")
+
+
+class PlanCompareIn(BaseModel):
+    """方案对比请求。"""
+
+    source_plan_id: str = Field(..., min_length=1, description="来源方案 ID")
+    target_plan_id: str = Field(..., min_length=1, description="目标方案 ID")
+
+
+class KilnPairOut(BaseModel):
+    """一对配对的窑次（序号均从 1 开始）。"""
+
+    source_index: int = Field(..., description="来源方案窑次序号")
+    target_index: int = Field(..., description="目标方案窑次序号")
+
+
+class PlanCompareOut(BaseModel):
+    """两份方案的比较结果（只读计算，不改写任一方案）。"""
+
+    source_plan_id: str = Field(..., description="来源方案 ID")
+    target_plan_id: str = Field(..., description="目标方案 ID")
+    common_count: int = Field(..., description="共同器物数")
+    pair_count: int = Field(..., description="窑次配对数（两边窑次数的较小值）")
+    kiln_pairs: list[KilnPairOut] = Field(
+        ..., description="窑次配对，按来源窑次序号升序"
+    )
+    stayed_item_ids: list[str] = Field(
+        ..., description="留在对应窑的共同器物编号，按编号升序"
+    )
+    moved_item_ids: list[str] = Field(
+        ..., description="换窑的共同器物编号（含未落在配对窑内者），按编号升序"
+    )
+    only_in_source_item_ids: list[str] = Field(
+        ..., description="仅出现在来源方案的器物编号，按编号升序"
+    )
+    only_in_target_item_ids: list[str] = Field(
+        ..., description="仅出现在目标方案的器物编号，按编号升序"
+    )

@@ -19,10 +19,17 @@
 枚举全部子集，在 dp[mask] 不超过窑次上限的子集内，按「保留件数最多 →
 保留总体积最大 → 保留编号升序列表字典序最小」择优；选中器物的装窑
 仍调用 solve，沿用最少窑次与字典序排序。
+
+方案对比（compare_kiln_assignments）：以共同器物编号为范围，把来源与
+目标窑次一对一配对（配对数取两边窑次数较小值），使留在对应窑中的共同
+器物数最大。权重 w[i][j] = 来源窑 i 与目标窑 j 的共同器物数，问题即
+二分图最大权匹配；用「按来源窑序 × 目标窑子集」的位掩码 DP 求最优值，
+再按「（来源序号、目标序号）配对序列字典序最小」贪心重建配对。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -58,6 +65,21 @@ class ProductionLimit:
     kept_item_ids: tuple[str, ...]
     delayed_item_ids: tuple[str, ...]
     kilns: tuple[Kiln, ...]
+
+
+@dataclass(frozen=True)
+class PlanComparison:
+    """两份方案的比较结果。
+
+    pairs 为（来源窑次序号, 目标窑次序号）配对，按来源序号升序；
+    各编号列表均按标准字符串字典序升序。
+    """
+
+    pairs: tuple[tuple[int, int], ...]
+    stayed_item_ids: tuple[str, ...]        # 留在对应窑的共同器物
+    moved_item_ids: tuple[str, ...]         # 换窑的共同器物（含未落在配对窑内者）
+    only_in_source_item_ids: tuple[str, ...]
+    only_in_target_item_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -331,3 +353,124 @@ def min_capacity_for_target(
             lo = mid + 1
 
     return lo, best_kilns
+
+
+def compare_kiln_assignments(
+    source_kilns: Sequence[Sequence[str]],
+    target_kilns: Sequence[Sequence[str]],
+) -> PlanComparison:
+    """比较两份排程方案，求来源与目标窑次的一对一配对。
+
+    以共同器物编号为范围，配对数取两边窑次数的较小值，使留在对应窑中的
+    共同器物数最大；最优解并列时，按来源序号排序的（来源序号、目标序号）
+    配对序列取字典序最小。共同器物未落在配对窑内（所在来源窑或目标窑
+    未被配对）也算换窑。
+
+    记 w[i][j] 为来源窑 i 与目标窑 j 的共同器物数，则「留窑数最大」即
+    二分图最大权匹配。窑次数不超过器物数（≤ 14），用位掩码 DP 求解：
+    g[i][tmask] 表示来源窑 i..m 在目标窑已用集合 tmask 下、恰好配满
+    pair_count 对时剩余配对最多还能保留的共同器物数（不可行为 -1）；
+    再按配对序列字典序最小贪心重建。
+
+    :param source_kilns: 来源方案各窑的器物编号（窑次序号从 1 开始，与列表顺序一致）
+    :param target_kilns: 目标方案各窑的器物编号
+    :raises ValueError: 任一方案的窑次列表为空。
+    """
+
+    m = len(source_kilns)
+    k = len(target_kilns)
+    if m == 0 or k == 0:
+        raise ValueError("每份方案至少包含一个窑次")
+
+    # 器物编号 -> 所在窑次序号（1 起）
+    src_of: dict[str, int] = {}
+    for idx, kiln in enumerate(source_kilns, start=1):
+        for item_id in kiln:
+            src_of[item_id] = idx
+    tgt_of: dict[str, int] = {}
+    for idx, kiln in enumerate(target_kilns, start=1):
+        for item_id in kiln:
+            tgt_of[item_id] = idx
+
+    common = sorted(set(src_of) & set(tgt_of))
+
+    # w[i][j]：来源窑 i 与目标窑 j（序号均从 1 开始）的共同器物数
+    w = [[0] * (k + 1) for _ in range(m + 1)]
+    for item_id in common:
+        w[src_of[item_id]][tgt_of[item_id]] += 1
+
+    pair_count = min(m, k)
+    size = 1 << k
+    full = size - 1
+
+    # ---- 位掩码 DP：最大留窑数（恰好配满 pair_count 对才可行） ----
+    g = [[-1] * size for _ in range(m + 2)]
+    row_end = g[m + 1]
+    for tmask in range(size):
+        if tmask.bit_count() == pair_count:
+            row_end[tmask] = 0
+    for i in range(m, 0, -1):
+        row = g[i]
+        nxt = g[i + 1]
+        wi = w[i]
+        for tmask in range(size):
+            best = nxt[tmask]  # 来源窑 i 不配对
+            avail = full ^ tmask
+            while avail:
+                bit = avail & -avail
+                j = bit.bit_length()  # bit 位 0 起 -> 目标窑序号 j（1 起）
+                prev = nxt[tmask | bit]
+                if prev >= 0:
+                    cand = wi[j] + prev
+                    if cand > best:
+                        best = cand
+                avail ^= bit
+            row[tmask] = best
+
+    # ---- 贪心重建字典序最小的配对序列 ----
+    # 序列按来源序号升序；若某个最优完成配对了来源窑 i，则下一对必为
+    # (i, j)，字典序恒小于任何以更大来源序号开头的序列，故逐窑取满足
+    # 最优值的最小目标序号即可。
+    pairs: list[tuple[int, int]] = []
+    tmask = 0
+    for i in range(1, m + 1):
+        row = g[i]
+        nxt = g[i + 1]
+        wi = w[i]
+        chosen_bit = 0
+        chosen_j = 0
+        avail = full ^ tmask
+        while avail:
+            bit = avail & -avail  # 目标序号升序枚举，首个可行者即最小
+            j = bit.bit_length()
+            prev = nxt[tmask | bit]
+            if prev >= 0 and wi[j] + prev == row[tmask]:
+                chosen_bit = bit
+                chosen_j = j
+                break
+            avail ^= bit
+        if chosen_bit:
+            pairs.append((i, chosen_j))
+            tmask |= chosen_bit
+        # 否则来源窑 i 不配对（此时必有 g[i+1][tmask] == g[i][tmask]）
+
+    # ---- 汇总留窑 / 换窑 / 单方独有编号（均按编号升序） ----
+    pair_map = dict(pairs)
+    stayed: list[str] = []
+    moved: list[str] = []
+    for item_id in common:
+        if pair_map.get(src_of[item_id]) == tgt_of[item_id]:
+            stayed.append(item_id)
+        else:
+            moved.append(item_id)
+
+    only_in_source = sorted(set(src_of) - set(tgt_of))
+    only_in_target = sorted(set(tgt_of) - set(src_of))
+
+    return PlanComparison(
+        pairs=tuple(pairs),
+        stayed_item_ids=tuple(stayed),
+        moved_item_ids=tuple(moved),
+        only_in_source_item_ids=tuple(only_in_source),
+        only_in_target_item_ids=tuple(only_in_target),
+    )

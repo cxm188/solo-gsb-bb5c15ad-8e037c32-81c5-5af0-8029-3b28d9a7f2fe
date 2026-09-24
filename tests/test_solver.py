@@ -10,6 +10,7 @@ from app.solver import (  # noqa: E402
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
+    compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
     solve,
@@ -399,6 +400,156 @@ def test_production_limit_random_brute_force():
         assert [k.firing_temp for k in result.kilns] == [
             k.firing_temp for k in exp_kilns
         ]
+
+
+# ---------------------------------------------------------------------------
+# 方案对比 compare_kiln_assignments
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_compare(source_kilns, target_kilns):
+    """枚举全部一对一配对，返回 (配对序列, 留窑的共同器物集合)。
+
+    配对序列按来源序号升序；最优解并列时取序列字典序最小者（与接口一致）。
+    """
+    from itertools import combinations, permutations
+
+    m, k = len(source_kilns), len(target_kilns)
+    pair_count = min(m, k)
+    src_of = {x: i + 1 for i, kiln in enumerate(source_kilns) for x in kiln}
+    tgt_of = {x: j + 1 for j, kiln in enumerate(target_kilns) for x in kiln}
+    common = set(src_of) & set(tgt_of)
+
+    best = None  # (留窑数取负, 配对序列, 留窑集合)
+    for srcs in combinations(range(1, m + 1), pair_count):
+        for tgts in permutations(range(1, k + 1), pair_count):
+            pairs = tuple(zip(srcs, tgts))
+            pair_map = dict(pairs)
+            stayed = {
+                x for x in common if pair_map.get(src_of[x]) == tgt_of[x]
+            }
+            key = (-len(stayed), pairs)
+            if best is None or key < best[:2]:
+                best = (key[0], pairs, stayed)
+    return best[1], best[2]
+
+
+def _check_compare_result(result, source_kilns, target_kilns):
+    """校验对比结果与暴力枚举一致，且各编号列表升序、划分完备。"""
+    src_ids = {x for kiln in source_kilns for x in kiln}
+    tgt_ids = {x for kiln in target_kilns for x in kiln}
+    common = src_ids & tgt_ids
+
+    exp_pairs, exp_stayed = _brute_force_compare(source_kilns, target_kilns)
+    assert result.pairs == exp_pairs, (
+        f"pairs {result.pairs} != {exp_pairs}, "
+        f"source={source_kilns}, target={target_kilns}"
+    )
+    # 配对数取两边窑次数较小值，来源序号升序且互不重复、目标序号互不重复
+    assert len(result.pairs) == min(len(source_kilns), len(target_kilns))
+    assert [s for s, _ in result.pairs] == sorted(s for s, _ in result.pairs)
+    assert len({t for _, t in result.pairs}) == len(result.pairs)
+
+    assert set(result.stayed_item_ids) == exp_stayed
+    assert list(result.stayed_item_ids) == sorted(result.stayed_item_ids)
+    # 换窑 = 共同器物 - 留窑；未落在配对窑内也算换窑
+    assert set(result.moved_item_ids) == common - exp_stayed
+    assert list(result.moved_item_ids) == sorted(result.moved_item_ids)
+    # 单方独有编号
+    assert set(result.only_in_source_item_ids) == src_ids - tgt_ids
+    assert list(result.only_in_source_item_ids) == sorted(
+        result.only_in_source_item_ids
+    )
+    assert set(result.only_in_target_item_ids) == tgt_ids - src_ids
+    assert list(result.only_in_target_item_ids) == sorted(
+        result.only_in_target_item_ids
+    )
+
+
+def test_compare_basic():
+    # 来源 [a b] [c]，目标 [a] [b c]：唯一最优配对 (1,1)(2,2)，b 换窑
+    result = compare_kiln_assignments([["a", "b"], ["c"]], [["a"], ["b", "c"]])
+    assert result.pairs == ((1, 1), (2, 2))
+    assert result.stayed_item_ids == ("a", "c")
+    assert result.moved_item_ids == ("b",)
+    assert result.only_in_source_item_ids == ()
+    assert result.only_in_target_item_ids == ()
+
+
+def test_compare_tiebreak_lex_by_source():
+    # 来源 3 窑、目标 2 窑：(1,1)(3,2) 与 (2,1)(3,2) 留窑数同为 2，
+    # 配对序列字典序最小者为 (1,1)(3,2)。
+    result = compare_kiln_assignments(
+        [["a"], ["b"], ["c"]], [["a", "b"], ["c"]]
+    )
+    assert result.pairs == ((1, 1), (3, 2))
+    assert result.stayed_item_ids == ("a", "c")
+    assert result.moved_item_ids == ("b",)
+
+
+def test_compare_unpaired_kiln_counts_as_moved():
+    # 目标仅 1 窑：配对 (1,1) 后 b 所在来源窑 2 未配对，未落在配对窑内算换窑
+    result = compare_kiln_assignments([["a"], ["b"]], [["a", "b"]])
+    assert result.pairs == ((1, 1),)
+    assert result.stayed_item_ids == ("a",)
+    assert result.moved_item_ids == ("b",)
+
+
+def test_compare_no_common_items():
+    # 无共同器物：留窑数恒为 0，字典序最小配对为 (1,1)
+    result = compare_kiln_assignments([["x", "y"]], [["p", "q"], ["r"]])
+    assert result.pairs == ((1, 1),)
+    assert result.stayed_item_ids == ()
+    assert result.moved_item_ids == ()
+    assert result.only_in_source_item_ids == ("x", "y")
+    assert result.only_in_target_item_ids == ("p", "q", "r")
+
+
+def test_compare_identical_plans():
+    # 同一方案对比：恒等配对，全部留窑
+    kilns = [["a", "b"], ["c"]]
+    result = compare_kiln_assignments(kilns, kilns)
+    assert result.pairs == ((1, 1), (2, 2))
+    assert result.stayed_item_ids == ("a", "b", "c")
+    assert result.moved_item_ids == ()
+
+
+def test_compare_standard_lex_order_of_ids():
+    # 编号列表按标准字符串字典序升序（"10" < "2"）
+    result = compare_kiln_assignments(
+        [["2"], ["10"], ["3"]], [["2"], ["10"], ["3"]]
+    )
+    assert result.stayed_item_ids == ("10", "2", "3")
+
+
+def test_compare_empty_kilns_rejected():
+    try:
+        compare_kiln_assignments([], [["a"]])
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+
+def test_compare_random_brute_force():
+    # 随机小规模用例：配对序列与全部编号列表同暴力枚举交叉验证
+    rng = random.Random(2024)
+    for trial in range(150):
+        pool = [f"id{i}" for i in range(rng.randint(1, 6))]
+
+        def random_plan():
+            items = [x for x in pool if rng.random() < 0.7] or [
+                pool[rng.randrange(len(pool))]
+            ]
+            rng.shuffle(items)
+            kilns = [[] for _ in range(rng.randint(1, min(4, len(items))))]
+            for x in items:
+                kilns[rng.randrange(len(kilns))].append(x)
+            return [sorted(kk) for kk in kilns if kk]
+
+        source_kilns = random_plan()
+        target_kilns = random_plan()
+        result = compare_kiln_assignments(source_kilns, target_kilns)
+        _check_compare_result(result, source_kilns, target_kilns)
 
 
 if __name__ == "__main__":
