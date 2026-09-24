@@ -10,6 +10,7 @@ from app.solver import (  # noqa: E402
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
+    compare_plans,
     min_capacity_for_target,
     select_within_kiln_limit,
     solve,
@@ -399,6 +400,176 @@ def test_production_limit_random_brute_force():
         assert [k.firing_temp for k in result.kilns] == [
             k.firing_temp for k in exp_kilns
         ]
+
+
+# ---------------------------------------------------------------------------
+# 方案比较 compare_plans
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_compare(source_kilns, target_kilns):
+    """枚举全部一对一配对，返回 (最大留窑数, 字典序最小配对序列)。"""
+    m, n = len(source_kilns), len(target_kilns)
+    k = min(m, n)
+    src_sets = [set(x) for x in source_kilns]
+    tgt_sets = [set(x) for x in target_kilns]
+    best = None  # (-留窑数, 配对序列)
+
+    def rec(i, used, pairs, score):
+        nonlocal best
+        if len(pairs) == k or i == m:
+            if len(pairs) == k:
+                key = (-score, tuple(pairs))
+                if best is None or key < best:
+                    best = key
+            return
+        # 来源窑 i 不参与配对
+        rec(i + 1, used, pairs, score)
+        for j in range(n):
+            if j in used:
+                continue
+            rec(
+                i + 1,
+                used | {j},
+                pairs + [(i + 1, j + 1)],
+                score + len(src_sets[i] & tgt_sets[j]),
+            )
+
+    rec(0, set(), [], 0)
+    return -best[0], best[1]
+
+
+def test_compare_plans_basic():
+    # 来源 2 窑、目标 3 窑：配对数取较小值 2；唯一最优配对 (1,2)(2,1)。
+    source = [["p1", "p2"], ["p3", "p4", "p5"]]
+    target = [["p3", "p4", "p6"], ["p1", "p2"], ["p5"]]
+    result = compare_plans(source, target)
+    assert result.pair_count == 2
+    assert [(p.source_index, p.target_index) for p in result.kiln_pairs] == [
+        (1, 2),
+        (2, 1),
+    ]
+    assert result.kiln_pairs[0].stayed_item_ids == ("p1", "p2")
+    assert result.kiln_pairs[1].stayed_item_ids == ("p3", "p4")
+    assert result.common_item_ids == ("p1", "p2", "p3", "p4", "p5")
+    assert result.stayed_item_ids == ("p1", "p2", "p3", "p4")
+    # p5 在来源窑 2、目标窑 3，而目标窑 3 未参与配对 -> 换窑
+    assert result.changed_item_ids == ("p5",)
+    assert result.only_in_source_item_ids == ()
+    assert result.only_in_target_item_ids == ("p6",)
+
+
+def test_compare_plans_changed_when_not_in_paired_kilns():
+    # 共同器物未落在配对窑内也算换窑：p1、p2 在来源同窑、目标分窑，
+    # 配对数取较小值 1，两个最优配对 (1,1) 与 (1,2) 并列，
+    # 取字典序最小的 (1,1)，p2 未落在配对窑内 -> 换窑。
+    source = [["p1", "p2"]]
+    target = [["p1"], ["p2"]]
+    result = compare_plans(source, target)
+    assert result.pair_count == 1
+    assert [(p.source_index, p.target_index) for p in result.kiln_pairs] == [
+        (1, 1),
+    ]
+    assert result.stayed_item_ids == ("p1",)
+    assert result.changed_item_ids == ("p2",)
+
+
+def test_compare_plans_lex_tiebreak():
+    # 两个最优配对得分相同：(1,1)(2,2) 与 (1,2)(2,1)，取字典序最小者。
+    source = [["a"], ["b"]]
+    target = [["a"], ["b"]]
+    result = compare_plans(source, target)
+    assert [(p.source_index, p.target_index) for p in result.kiln_pairs] == [
+        (1, 1),
+        (2, 2),
+    ]
+    assert result.stayed_item_ids == ("a", "b")
+    assert result.changed_item_ids == ()
+
+
+def test_compare_plans_unmatched_source_kiln():
+    # 来源窑多于目标窑：配对数为目标窑数 2，唯一最优配对 (1,1)(2,2)，
+    # 来源窑 3 不参与配对，其中的共同器物 z 计为换窑。
+    source = [["x"], ["y1", "y2"], ["z"]]
+    target = [["x"], ["y1", "y2", "z"]]
+    result = compare_plans(source, target)
+    assert result.pair_count == 2
+    assert [(p.source_index, p.target_index) for p in result.kiln_pairs] == [
+        (1, 1),
+        (2, 2),
+    ]
+    assert result.stayed_item_ids == ("x", "y1", "y2")
+    assert result.changed_item_ids == ("z",)
+    assert result.only_in_source_item_ids == ()
+    assert result.only_in_target_item_ids == ()
+
+
+def test_compare_plans_identical_plans():
+    source = [["a", "b"], ["c"]]
+    result = compare_plans(source, [["a", "b"], ["c"]])
+    assert result.pair_count == 2
+    assert [(p.source_index, p.target_index) for p in result.kiln_pairs] == [
+        (1, 1),
+        (2, 2),
+    ]
+    assert result.stayed_item_ids == ("a", "b", "c")
+    assert result.changed_item_ids == ()
+    assert result.only_in_source_item_ids == ()
+    assert result.only_in_target_item_ids == ()
+
+
+def test_compare_plans_random_brute_force():
+    rng = random.Random(2024)
+    for trial in range(200):
+        pool = [f"w{i}" for i in range(rng.randint(1, 8))]
+
+        def random_partition(max_kilns):
+            # 随机非空划分：每件器物随机进一窑，再丢弃空窑
+            kilns = [[] for _ in range(rng.randint(1, max_kilns))]
+            for item in pool:
+                kilns[rng.randrange(len(kilns))].append(item)
+            return [sorted(k) for k in kilns if k]
+
+        source = random_partition(5)
+        target = random_partition(5)
+
+        result = compare_plans(source, target)
+        exp_score, exp_pairs = _brute_force_compare(source, target)
+
+        got_pairs = tuple(
+            (p.source_index, p.target_index) for p in result.kiln_pairs
+        )
+        assert got_pairs == exp_pairs, (
+            f"trial {trial}: pairs {got_pairs} != {exp_pairs}, "
+            f"source={source}, target={target}"
+        )
+        assert result.pair_count == min(len(source), len(target))
+        assert len(result.stayed_item_ids) == exp_score
+
+        # 各编号列表的派生关系与升序
+        src_all = set().union(*(set(k) for k in source))
+        tgt_all = set().union(*(set(k) for k in target))
+        common = src_all & tgt_all
+        stayed = set(result.stayed_item_ids)
+        assert stayed <= common
+        assert set(result.changed_item_ids) == common - stayed
+        assert set(result.common_item_ids) == common
+        assert set(result.only_in_source_item_ids) == src_all - common
+        assert set(result.only_in_target_item_ids) == tgt_all - common
+        for ids in (
+            result.common_item_ids,
+            result.stayed_item_ids,
+            result.changed_item_ids,
+            result.only_in_source_item_ids,
+            result.only_in_target_item_ids,
+        ):
+            assert list(ids) == sorted(ids)
+        # 每对窑的留窑编号 = 两窑交集
+        for p in result.kiln_pairs:
+            shared = set(source[p.source_index - 1]) & set(
+                target[p.target_index - 1]
+            )
+            assert set(p.stayed_item_ids) == shared
 
 
 if __name__ == "__main__":

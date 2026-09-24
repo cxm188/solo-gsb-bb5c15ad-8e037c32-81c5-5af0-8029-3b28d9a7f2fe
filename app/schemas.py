@@ -118,3 +118,61 @@ class ProductionLimitOut(BaseModel):
     delayed_item_ids: list[str] = Field(..., description="延期器物编号，按编号升序")
     kiln_count: int = Field(..., description="保留器物的实际窑次（最少窑次）")
     kilns: list[KilnOut] = Field(..., description="保留器物的实际装窑明细")
+
+
+class PlanCompareIn(BaseModel):
+    """方案比较请求。"""
+
+    source_plan_id: str = Field(..., min_length=1, description="来源方案 ID")
+    target_plan_id: str = Field(..., min_length=1, description="目标方案 ID")
+
+    @field_validator("source_plan_id", "target_plan_id")
+    @classmethod
+    def _strip_and_check(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("方案 ID 不得为空白字符串")
+        return v
+
+
+class KilnPairOut(BaseModel):
+    """一组成对的窑次及其留窑共同器物。"""
+
+    source_index: int = Field(..., description="来源方案窑次序号，从 1 开始")
+    target_index: int = Field(..., description="目标方案窑次序号，从 1 开始")
+    stayed_item_ids: list[str] = Field(
+        ..., description="两窑共有的留窑共同器物编号，按编号升序"
+    )
+
+
+class PlanCompareOut(BaseModel):
+    """两份已保存排程的比较结果（只读计算，不改写任一方案）。"""
+
+    source_plan_id: str = Field(..., description="来源方案 ID")
+    target_plan_id: str = Field(..., description="目标方案 ID")
+    source_kiln_count: int = Field(..., description="来源方案窑次数")
+    target_kiln_count: int = Field(..., description="目标方案窑次数")
+    pair_count: int = Field(..., description="窑次配对数（两边窑次数较小值）")
+    kiln_pairs: list[KilnPairOut] = Field(
+        ..., description="窑次配对明细，按来源序号升序"
+    )
+    common_count: int = Field(..., description="共同器物数")
+    common_item_ids: list[str] = Field(
+        ..., description="共同器物编号（比较范围），按编号升序"
+    )
+    stayed_count: int = Field(..., description="留在对应窑的共同器物数")
+    stayed_item_ids: list[str] = Field(
+        ..., description="留在对应窑的共同器物编号，按编号升序"
+    )
+    changed_count: int = Field(..., description="换窑的共同器物数")
+    changed_item_ids: list[str] = Field(
+        ..., description="换窑的共同器物编号，按编号升序"
+    )
+    only_in_source_count: int = Field(..., description="仅出现在来源方案的器物数")
+    only_in_source_item_ids: list[str] = Field(
+        ..., description="仅出现在来源方案的器物编号，按编号升序"
+    )
+    only_in_target_count: int = Field(..., description="仅出现在目标方案的器物数")
+    only_in_target_item_ids: list[str] = Field(
+        ..., description="仅出现在目标方案的器物编号，按编号升序"
+    )

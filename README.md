@@ -232,6 +232,80 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/pro
 - `404` `PLAN_NOT_FOUND`：方案不存在；
 - `422`：请求参数非法（如 `max_kilns` 小于 1 或非整数）。
 
+### 5. 比较两份已保存排程方案
+
+`POST http://localhost:8000/plans/compare`
+
+针对**两份已保存**的方案，以**共同器物编号**（同时出现在两份方案中的编号）
+为比较范围，将来源与目标的窑次**一对一配对**：
+
+- 配对数取两边窑次数的**较小值** `min(来源窑数, 目标窑数)`，多余的窑不参与配对；
+- 一对窑次的「留窑共同器物数」为两窑器物集合的**交集大小**，配对使全部配对的
+  留窑数之和**最大**（最大权二分匹配，子集 DP 求解）；
+- 最优解并列时，取按来源序号升序排列的 `((来源序号, 目标序号), ...)` 配对序列
+  **字典序最小**者；
+- 共同器物若**未落在配对窑内**（两份方案把它放进了不同窑，或它所在的某一窑
+  未参与配对），一律计为**换窑**。
+
+**只读计算，不改写任一方案。**
+
+请求体：
+
+```json
+{
+  "source_plan_id": "6a2a16af1e3e4c44bf96503cc71b0dbc",
+  "target_plan_id": "cb92eae13e974ebea58e43b38cbbe89f"
+}
+```
+
+字段约束：两个方案 ID 均为非空字符串，且对应方案都已保存。
+
+curl 示例：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"source_plan_id": "6a2a16af1e3e4c44bf96503cc71b0dbc", "target_plan_id": "cb92eae13e974ebea58e43b38cbbe89f"}'
+```
+
+成功响应 `200 OK`（所有编号列表均按编号升序）：
+
+```json
+{
+  "source_plan_id": "6a2a16af1e3e4c44bf96503cc71b0dbc",
+  "target_plan_id": "cb92eae13e974ebea58e43b38cbbe89f",
+  "source_kiln_count": 3,
+  "target_kiln_count": 3,
+  "pair_count": 3,
+  "kiln_pairs": [
+    {"source_index": 1, "target_index": 1, "stayed_item_ids": ["p1"]},
+    {"source_index": 2, "target_index": 2, "stayed_item_ids": ["p2"]},
+    {"source_index": 3, "target_index": 3, "stayed_item_ids": ["p4"]}
+  ],
+  "common_count": 5,
+  "common_item_ids": ["p1", "p2", "p3", "p4", "p5"],
+  "stayed_count": 3,
+  "stayed_item_ids": ["p1", "p2", "p4"],
+  "changed_count": 2,
+  "changed_item_ids": ["p3", "p5"],
+  "only_in_source_count": 0,
+  "only_in_source_item_ids": [],
+  "only_in_target_count": 1,
+  "only_in_target_item_ids": ["p6"]
+}
+```
+
+上例中来源方案窑次为 `[p1] / [p2,p3] / [p4,p5]`，目标方案为
+`[p1] / [p2,p5,p6] / [p3,p4]`：共同器物为 `p1～p5`；最优配对
+`(1,1)(2,2)(3,3)` 与 `(1,1)(2,3)(3,2)` 留窑数同为 3，按字典序取前者；
+`p3`（来源窑 2 → 目标窑 3）与 `p5`（来源窑 3 → 目标窑 2）未落在配对窑内，
+计为换窑；`p6` 仅出现在目标方案。
+
+错误情况：
+
+- `404` `PLAN_NOT_FOUND`：任一方案不存在；
+- `422`：请求参数非法（如方案 ID 为空白字符串）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -270,11 +344,18 @@ n = 14 时子集总数 16 384，典型耗时在 1 秒以内。
 故实际窑次取保留器物的最少窑次，方案排序与创建接口完全一致。
 n = 14 时与求解器同为万级枚举规模，典型耗时约 1～3 秒。
 
+`compare` 接口的方案比较与装窑约束无关，只读取两份方案保存的窑次器物
+划分：以共同器物编号为范围，把每对「来源窑 i、目标窑 j」的交集大小
+作为权重，问题即 **m × n 最大权二分匹配**（m、n ≤ 14）。用子集 DP
+求解：处理完前 i 个来源窑后，以目标窑占用掩码为状态，记录该状态下
+留窑数最大、且配对序列字典序最小的方案，状态规模至多 `14 · 2^14`；
+配对数固定为 `min(m, n)`，来源窑较多时未配对的来源窑直接跳过。
+
 ## 目录结构
 
 ```
 app/
-  solver.py     # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
+  solver.py     # 位掩码 DP + 字典序重建 + 方案比较（纯函数，无框架依赖）
   database.py   # SQLite 初始化与读写
   schemas.py    # Pydantic 请求/响应模型
   main.py       # FastAPI 路由

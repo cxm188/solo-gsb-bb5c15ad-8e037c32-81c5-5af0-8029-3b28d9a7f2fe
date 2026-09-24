@@ -19,6 +19,11 @@
 枚举全部子集，在 dp[mask] 不超过窑次上限的子集内，按「保留件数最多 →
 保留总体积最大 → 保留编号升序列表字典序最小」择优；选中器物的装窑
 仍调用 solve，沿用最少窑次与字典序排序。
+
+方案比较（compare_plans）与装窑约束无关：以两份方案的共同器物编号为
+范围，把窑次一对一配对（配对数取两边窑次数较小值），用子集 DP 求
+「留在对应窑中的共同器物数」最大的配对，并列时取按来源序号排序的
+（来源序号、目标序号）配对序列字典序最小者。
 """
 
 from __future__ import annotations
@@ -58,6 +63,28 @@ class ProductionLimit:
     kept_item_ids: tuple[str, ...]
     delayed_item_ids: tuple[str, ...]
     kilns: tuple[Kiln, ...]
+
+
+@dataclass(frozen=True)
+class KilnMatch:
+    """一组成对窑次：来源窑序号、目标窑序号与两窑共有的留窑器物编号（升序）。"""
+
+    source_index: int
+    target_index: int
+    stayed_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlanComparison:
+    """两份已保存排程的比较结果（只读计算，不改写任一方案）。"""
+
+    pair_count: int
+    kiln_pairs: tuple[KilnMatch, ...]
+    common_item_ids: tuple[str, ...]
+    stayed_item_ids: tuple[str, ...]
+    changed_item_ids: tuple[str, ...]
+    only_in_source_item_ids: tuple[str, ...]
+    only_in_target_item_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -331,3 +358,129 @@ def min_capacity_for_target(
             lo = mid + 1
 
     return lo, best_kilns
+
+
+def compare_plans(
+    source_kilns: list[list[str]] | tuple[tuple[str, ...], ...],
+    target_kilns: list[list[str]] | tuple[tuple[str, ...], ...],
+) -> PlanComparison:
+    """比较两份已保存排程，求使「留在对应窑中的共同器物数」最大的窑次配对。
+
+    以两份方案的**共同器物编号**（同时出现在两方案中的编号）为比较范围：
+      * 来源窑与目标窑**一对一**配对，配对数取两边窑次数较小值
+        ``k = min(m, n)``，多余的窑不参与配对；
+      * 一对窑次 (i, j) 的留窑共同器物数为两窑器物集合的交集大小；
+      * 最大化所有配对的交集大小之和（最大权二分匹配 / 指派问题）；
+      * 最优解并列时，取按来源序号升序排列的
+        ``((来源序号, 目标序号), ...)`` 序列字典序最小者。
+
+    共同器物若不在其所属的成对窑次内（即两方案把它放进了不同窑，
+    或它所在的某一窑未参与配对），一律计为换窑。
+
+    器物编号列表均按标准字符串字典序升序返回；本函数为纯函数，
+    不依赖容量、温度等装窑约束，只读取两份方案的窑次器物划分。
+
+    算法（n ≤ 14 件器物 ⇒ 每方案至多 14 窑）：子集 DP。处理完前 i 个
+    来源窑后，以目标窑占用掩码 ``mask`` 为状态，记录该状态下留窑器物数
+    最大、且配对序列字典序最小的方案；配对数固定为 ``min(m, n)``，
+    来源窑较多时未配对的来源窑直接跳过。规模至多 ``14 · 2^14``。
+    """
+
+    src = [tuple(sorted(k)) for k in source_kilns]
+    tgt = [tuple(sorted(k)) for k in target_kilns]
+    m, n = len(src), len(tgt)
+    if m == 0 or n == 0:
+        raise ValueError("两份方案都必须至少包含一个窑次")
+
+    src_sets = [set(k) for k in src]
+    tgt_sets = [set(k) for k in tgt]
+    common = sorted(set().union(*src_sets) & set().union(*tgt_sets))
+
+    # w[i][j] = 来源窑 i 与目标窑 j 的共同器物交集大小（留窑数权重）。
+    weight = [
+        [len(src_sets[i] & tgt_sets[j]) for j in range(n)] for i in range(m)
+    ]
+
+    k = min(m, n)
+    size = 1 << n
+    neg_inf = -1
+    # best_w[mask]：处理完当前来源窑、目标占用掩码为 mask 时的最大留窑数；
+    # best_seq[mask]：该分数下字典序最小的 (来源序号, 目标序号) 配对序列。
+    best_w = [neg_inf] * size
+    best_seq: list[tuple[tuple[int, int], ...] | None] = [None] * size
+    best_w[0] = 0
+    best_seq[0] = ()
+
+    for i in range(m):
+        new_w = [neg_inf] * size
+        new_seq: list[tuple[tuple[int, int], ...] | None] = [None] * size
+        for mask in range(size):
+            if best_w[mask] < 0:
+                continue
+            seq = best_seq[mask]
+            # 来源窑较多时，允许本来源窑不参与配对（跳过）。
+            if best_w[mask] > new_w[mask] or (
+                best_w[mask] == new_w[mask]
+                and seq is not None
+                and (new_seq[mask] is None or seq < new_seq[mask])
+            ):
+                new_w[mask] = best_w[mask]
+                new_seq[mask] = seq
+            # 将来源窑 i 与任一未占用的目标窑配对。
+            free = (size - 1) ^ mask
+            while free:
+                bit = free & -free
+                j = bit.bit_length() - 1
+                nm = mask | bit
+                score = best_w[mask] + weight[i][j]
+                nseq = seq + ((i + 1, j + 1),)
+                if score > new_w[nm] or (
+                    score == new_w[nm]
+                    and (new_seq[nm] is None or nseq < new_seq[nm])
+                ):
+                    new_w[nm] = score
+                    new_seq[nm] = nseq
+                free ^= bit
+        best_w, best_seq = new_w, new_seq
+
+    # 恰好配出 k 对：取 popcount 为 k 的状态。
+    final_score = -1
+    final_seq: tuple[tuple[int, int], ...] | None = None
+    for mask in range(size):
+        if mask.bit_count() != k or best_w[mask] < 0:
+            continue
+        if final_seq is None or best_w[mask] > final_score or (
+            best_w[mask] == final_score and best_seq[mask] < final_seq
+        ):
+            final_score = best_w[mask]
+            final_seq = best_seq[mask]
+
+    assert final_seq is not None and len(final_seq) == k
+
+    pairs: list[KilnMatch] = []
+    stayed: set[str] = set()
+    for si, tj in final_seq:
+        shared = tuple(sorted(src_sets[si - 1] & tgt_sets[tj - 1]))
+        pairs.append(
+            KilnMatch(source_index=si, target_index=tj, stayed_item_ids=shared)
+        )
+        stayed.update(shared)
+
+    common_set = set(common)
+    changed = tuple(x for x in common if x not in stayed)
+    only_source = tuple(
+        sorted((set().union(*src_sets)) - common_set)
+    )
+    only_target = tuple(
+        sorted((set().union(*tgt_sets)) - common_set)
+    )
+
+    return PlanComparison(
+        pair_count=k,
+        kiln_pairs=tuple(pairs),
+        common_item_ids=tuple(common),
+        stayed_item_ids=tuple(sorted(stayed)),
+        changed_item_ids=changed,
+        only_in_source_item_ids=only_source,
+        only_in_target_item_ids=only_target,
+    )

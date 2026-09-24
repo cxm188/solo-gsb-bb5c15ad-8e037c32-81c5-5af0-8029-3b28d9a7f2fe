@@ -1,6 +1,7 @@
 """陶艺工作室共窑排程 API。
 
 POST /plans                              提交器物与容量，求解、保存并返回方案
+POST /plans/compare                      比较两份已保存排程（窑次配对与器物异动）
 GET  /plans/{plan_id}                    按 ID 读取已保存方案
 POST /plans/{plan_id}/capacity-target    求使最少窑次不超过目标的最小单窑容量
 POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns 窑内择优保留器物
@@ -21,6 +22,9 @@ from .schemas import (
     CapacityTargetOut,
     ErrorOut,
     KilnOut,
+    KilnPairOut,
+    PlanCompareIn,
+    PlanCompareOut,
     PlanCreate,
     PlanOut,
     ProductionLimitIn,
@@ -30,6 +34,7 @@ from .solver import (
     CapacityExceededError,
     TargetUnreachableError,
     Ware,
+    compare_plans,
     min_capacity_for_target,
     select_within_kiln_limit,
     solve,
@@ -110,6 +115,66 @@ def create_plan(payload: PlanCreate) -> PlanOut:
 
     database.save_plan(plan)
     return PlanOut(**plan)
+
+
+@app.post(
+    "/plans/compare",
+    response_model=PlanCompareOut,
+    tags=["plans"],
+    responses={404: {"model": ErrorOut, "description": "任一方案不存在"}},
+    summary="比较两份已保存排程方案",
+)
+def compare_plan(payload: PlanCompareIn) -> PlanCompareOut:
+    source = database.get_plan(payload.source_plan_id)
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {payload.source_plan_id}",
+            },
+        )
+    target = database.get_plan(payload.target_plan_id)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {payload.target_plan_id}",
+            },
+        )
+
+    # 只读比较：仅读取两份方案保存的窑次器物划分，不回写任何方案。
+    result = compare_plans(
+        [k["item_ids"] for k in source["kilns"]],
+        [k["item_ids"] for k in target["kilns"]],
+    )
+
+    return PlanCompareOut(
+        source_plan_id=source["id"],
+        target_plan_id=target["id"],
+        source_kiln_count=source["kiln_count"],
+        target_kiln_count=target["kiln_count"],
+        pair_count=result.pair_count,
+        kiln_pairs=[
+            KilnPairOut(
+                source_index=p.source_index,
+                target_index=p.target_index,
+                stayed_item_ids=list(p.stayed_item_ids),
+            )
+            for p in result.kiln_pairs
+        ],
+        common_count=len(result.common_item_ids),
+        common_item_ids=list(result.common_item_ids),
+        stayed_count=len(result.stayed_item_ids),
+        stayed_item_ids=list(result.stayed_item_ids),
+        changed_count=len(result.changed_item_ids),
+        changed_item_ids=list(result.changed_item_ids),
+        only_in_source_count=len(result.only_in_source_item_ids),
+        only_in_source_item_ids=list(result.only_in_source_item_ids),
+        only_in_target_count=len(result.only_in_target_item_ids),
+        only_in_target_item_ids=list(result.only_in_target_item_ids),
+    )
 
 
 @app.get(
